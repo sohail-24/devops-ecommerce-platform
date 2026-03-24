@@ -15,6 +15,14 @@ jobs:
     - name: Setup Terraform
       uses: hashicorp/setup-terraform@v3
 
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ap-south-1
+
+
     - name: Terraform Init
       run: terraform -chdir=terraform init
 
@@ -48,23 +56,4 @@ jobs:
       run: |
         ssh -i key.pem ubuntu@$MASTER_IP "bash -s" < scripts/bootstrap.sh
     
-    name: Destroy Infra
-    on:
-      workflow_dispatch:   # manual trigger button
-    
-    jobs:
-      destroy:
-        runs-on: ubuntu-latest
-        
-        steps:
-        - name: Checkout
-          uses: actions/checkout@v4
-         
-        - name: Setup Terraform
-          uses: hashicorp/setup-terraform@v3
-         
-        - name: Terraform Init
-          run: terraform -chdir=terraform init
-          
-       - name: Terraform Destroy
-         run: terraform -chdir=terraform destroy -auto-approve 
+  
