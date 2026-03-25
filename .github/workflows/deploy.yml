@@ -51,16 +51,63 @@ jobs:
           sleep 10
         done
 
-    # 🔥 WAIT EXTRA (VERY IMPORTANT)
+    # 🔥 WAIT EXTRA
     - name: Wait for Instance Stabilization
       run: sleep 120
 
     # 🔥 RUN BOOTSTRAP
     - name: Run Bootstrap
       run: |
-        ssh -i key.pem ubuntu@$MASTER_IP "bash -s" < scripts/bootstrap.sh
+        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "bash -s" < scripts/bootstrap.sh
+
+    # 🔥 CHECK CLUSTER
+    - name: Verify Kubernetes Cluster
+      run: |
+        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "kubectl get nodes"
 
     # 🔥 APPLY ARGOCD APP
     - name: Apply ArgoCD App
       run: |
-        ssh -i key.pem ubuntu@$MASTER_IP "kubectl apply -f devops-ecommerce-kubeadm/argocd/app.yaml"
+        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "kubectl apply -f ~/devops-ecommerce-kubeadm/argocd/app.yaml"
+
+    # 🔥 WAIT FOR ARGOCD APP OBJECT
+    - name: Wait for ArgoCD Application
+      run: |
+        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP '
+          until kubectl get application ecommerce-app -n argocd; do
+            echo "Waiting for ArgoCD Application..."
+            sleep 10
+          done
+        '
+
+    # 🔥 SHOW APP STATUS
+    - name: Check ArgoCD App Status
+      run: |
+        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "kubectl get application -n argocd"
+
+    # 🔥 WAIT FOR ECOMMERCE NAMESPACE
+    - name: Wait for Ecommerce Namespace
+      run: |
+        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP '
+          until kubectl get ns ecommerce; do
+            echo "Waiting for ecommerce namespace..."
+            sleep 10
+          done
+        '
+
+    # 🔥 CHECK ECOMMERCE PODS
+    - name: Check Ecommerce Pods
+      run: |
+        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "kubectl get pods -n ecommerce || true"
+
+    # 🔥 DESCRIBE APP IF FAILED
+    - name: Debug ArgoCD App
+      if: always()
+      run: |
+        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+          kubectl describe application ecommerce-app -n argocd || true
+          echo '---'
+          kubectl get all -n ecommerce || true
+          echo '---'
+          kubectl get events -n ecommerce --sort-by=.metadata.creationTimestamp || true
+        "
