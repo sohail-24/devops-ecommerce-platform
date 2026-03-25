@@ -43,15 +43,15 @@ jobs:
         head -n 5 key.pem
         wc -l key.pem
 
-    # 🔥 WAIT FOR EC2
+    # 🔥 WAIT FOR EC2 SSH
     - name: Wait for SSH
       run: |
-        until ssh -i key.pem -o StrictHostKeyChecking=no ubuntu@$MASTER_IP "echo ready"; do
+        until ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "echo ready"; do
           echo "Waiting for EC2..."
           sleep 10
         done
 
-    # 🔥 WAIT EXTRA
+    # 🔥 WAIT EXTRA FOR INSTANCE CLOUD-INIT / PACKAGE STABILIZATION
     - name: Wait for Instance Stabilization
       run: sleep 120
 
@@ -60,10 +60,20 @@ jobs:
       run: |
         ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "bash -s" < scripts/bootstrap.sh
 
+    # 🔥 WAIT FOR K8S API TO STABILIZE
+    - name: Wait for Kubernetes API
+      run: |
+        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP '
+          until kubectl get nodes >/dev/null 2>&1; do
+            echo "Waiting for Kubernetes API..."
+            sleep 10
+          done
+        '
+
     # 🔥 CHECK CLUSTER
     - name: Verify Kubernetes Cluster
       run: |
-        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "kubectl get nodes"
+        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "kubectl get nodes -o wide"
 
     # 🔥 APPLY ARGOCD APP
     - name: Apply ArgoCD App
@@ -74,7 +84,7 @@ jobs:
     - name: Wait for ArgoCD Application
       run: |
         ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP '
-          until kubectl get application ecommerce-app -n argocd; do
+          until kubectl get application ecommerce-app -n argocd >/dev/null 2>&1; do
             echo "Waiting for ArgoCD Application..."
             sleep 10
           done
@@ -89,16 +99,78 @@ jobs:
     - name: Wait for Ecommerce Namespace
       run: |
         ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP '
-          until kubectl get ns ecommerce; do
+          until kubectl get ns ecommerce >/dev/null 2>&1; do
             echo "Waiting for ecommerce namespace..."
             sleep 10
           done
         '
 
+    # 🔥 SMALL BUFFER FOR ARGOCD RESOURCE CREATION
+    - name: Wait for Initial Resource Creation
+      run: sleep 30
+
+    # 🔥 CREATE / UPDATE DJANGO SECRET
+    - name: Create Django Secret
+      run: |
+        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+          kubectl create secret generic django-secret -n ecommerce \
+            --from-literal=SECRET_KEY='${{ secrets.DJANGO_SECRET_KEY }}' \
+            --from-literal=DATABASE_URL='${{ secrets.DATABASE_URL }}' \
+            --from-literal=REDIS_URL='${{ secrets.REDIS_URL }}' \
+            --from-literal=AWS_ACCESS_KEY_ID='${{ secrets.AWS_ACCESS_KEY_ID }}' \
+            --from-literal=AWS_SECRET_ACCESS_KEY='${{ secrets.AWS_SECRET_ACCESS_KEY }}' \
+            --from-literal=AWS_STORAGE_BUCKET_NAME='${{ secrets.AWS_STORAGE_BUCKET_NAME }}' \
+            --from-literal=AWS_S3_REGION_NAME='${{ secrets.AWS_S3_REGION_NAME }}' \
+            --dry-run=client -o yaml | kubectl apply -f -
+        "
+
+    # 🔥 WAIT AFTER SECRET APPLY
+    - name: Wait After Secret Apply
+      run: sleep 20
+
+    # 🔥 RESTART DJANGO TO PICK NEW SECRET
+    - name: Restart Django Deployment
+      run: |
+        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+          kubectl rollout restart deployment django -n ecommerce || true
+        "
+
+    # 🔥 WAIT BEFORE ROLLOUT STATUS
+    - name: Wait Before Rollout Check
+      run: sleep 20
+
+    # 🔥 WAIT FOR DJANGO ROLLOUT
+    - name: Wait for Django Rollout
+      run: |
+        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+          kubectl rollout status deployment django -n ecommerce --timeout=300s || true
+        "
+
     # 🔥 CHECK ECOMMERCE PODS
     - name: Check Ecommerce Pods
       run: |
-        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "kubectl get pods -n ecommerce || true"
+        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+          kubectl get pods -n ecommerce -o wide || true
+          echo '---'
+          kubectl get svc -n ecommerce || true
+          echo '---'
+          kubectl get jobs -n ecommerce || true
+        "
+
+    # 🔥 CHECK DJANGO AWS ENV
+    - name: Verify Django AWS Env
+      run: |
+        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+          kubectl exec -n ecommerce deploy/django -- env | grep AWS || true
+        "
+
+    # 🔥 SHOW DJANGO LOGS
+    - name: Show Django Logs
+      if: always()
+      run: |
+        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+          kubectl logs deploy/django -n ecommerce --tail=150 || true
+        "
 
     # 🔥 DESCRIBE APP IF FAILED
     - name: Debug ArgoCD App
