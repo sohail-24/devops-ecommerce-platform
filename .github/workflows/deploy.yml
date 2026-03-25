@@ -22,7 +22,6 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ap-south-1
 
-
     - name: Terraform Init
       run: terraform -chdir=terraform init
 
@@ -38,6 +37,7 @@ jobs:
       run: |
         echo "${{ secrets.EC2_KEY }}" | sed 's/\\n/\n/g' > key.pem
         chmod 400 key.pem
+
     - name: Debug Key
       run: |
         head -n 5 key.pem
@@ -51,13 +51,39 @@ jobs:
           sleep 10
         done
 
-    # 🔥 WAIT EXTRA (VERY IMPORTANT)
+    # 🔥 WAIT EXTRA
     - name: Wait for Instance Stabilization
       run: sleep 120
 
     # 🔥 RUN BOOTSTRAP
     - name: Run Bootstrap
       run: |
-        ssh -i key.pem ubuntu@$MASTER_IP "bash -s" < scripts/bootstrap.sh
-    
-  
+        ssh -i key.pem -o StrictHostKeyChecking=no ubuntu@$MASTER_IP "bash -s" < scripts/bootstrap.sh
+
+    # 🔥 WAIT FOR KUBERNETES API
+    - name: Wait for Kubernetes Ready
+      run: |
+        ssh -i key.pem -o StrictHostKeyChecking=no ubuntu@$MASTER_IP '
+          until kubectl get nodes; do
+            echo "Waiting for Kubernetes..."
+            sleep 15
+          done
+        '
+
+    # 🔥 CLONE / UPDATE REPO ON MASTER
+    - name: Clone Repo on Master
+      run: |
+        ssh -i key.pem -o StrictHostKeyChecking=no ubuntu@$MASTER_IP '
+          if [ ! -d "devops-ecommerce-kubeadm" ]; then
+            git clone https://github.com/sohail-24/devops-ecommerce-kubeadm.git
+          else
+            cd devops-ecommerce-kubeadm && git pull
+          fi
+        '
+
+    # 🔥 APPLY ARGOCD APPLICATION
+    - name: Apply ArgoCD App
+      run: |
+        ssh -i key.pem -o StrictHostKeyChecking=no ubuntu@$MASTER_IP '
+          kubectl apply -f devops-ecommerce-kubeadm/argocd/app.yaml
+        '
