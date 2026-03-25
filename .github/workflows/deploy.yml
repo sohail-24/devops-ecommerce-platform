@@ -51,39 +51,16 @@ jobs:
           sleep 10
         done
 
-    # 🔥 WAIT EXTRA
+    # 🔥 WAIT EXTRA (VERY IMPORTANT)
     - name: Wait for Instance Stabilization
       run: sleep 120
 
     # 🔥 RUN BOOTSTRAP
     - name: Run Bootstrap
       run: |
-        ssh -i key.pem -o StrictHostKeyChecking=no ubuntu@$MASTER_IP "bash -s" < scripts/bootstrap.sh
+        ssh -i key.pem ubuntu@$MASTER_IP "bash -s" < scripts/bootstrap.sh
 
-    # 🔥 WAIT FOR KUBERNETES API
-    - name: Wait for Kubernetes Ready
-      run: |
-        ssh -i key.pem -o StrictHostKeyChecking=no ubuntu@$MASTER_IP '
-          until kubectl get nodes; do
-            echo "Waiting for Kubernetes..."
-            sleep 15
-          done
-        '
-
-    # 🔥 CLONE / UPDATE REPO ON MASTER
-    - name: Clone Repo on Master
-      run: |
-        ssh -i key.pem -o StrictHostKeyChecking=no ubuntu@$MASTER_IP '
-          if [ ! -d "devops-ecommerce-kubeadm" ]; then
-            git clone https://github.com/sohail-24/devops-ecommerce-kubeadm.git
-          else
-            cd devops-ecommerce-kubeadm && git pull
-          fi
-        '
-
-    # 🔥 APPLY ARGOCD APPLICATION
+    # 🔥 APPLY ARGOCD APP
     - name: Apply ArgoCD App
       run: |
-        ssh -i key.pem -o StrictHostKeyChecking=no ubuntu@$MASTER_IP '
-          kubectl apply -f devops-ecommerce-kubeadm/argocd/app.yaml
-        '
+        ssh -i key.pem ubuntu@$MASTER_IP "kubectl apply -f devops-ecommerce-kubeadm/argocd/app.yaml"
