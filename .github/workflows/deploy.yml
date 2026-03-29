@@ -7,179 +7,250 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      TF_IN_AUTOMATION: true
+      AWS_REGION: ap-south-1
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v3
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
 
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ap-south-1
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
 
-    - name: Terraform Init
-      run: terraform -chdir=terraform init
+      - name: Terraform Format Check
+        run: terraform -chdir=terraform fmt -check || true
 
-    - name: Terraform Apply
-      run: terraform -chdir=terraform apply -auto-approve
+      - name: Terraform Init
+        run: terraform -chdir=terraform init
 
-    - name: Get Master IP
-      run: |
-        echo "MASTER_IP=$(terraform -chdir=terraform output -raw master_public_ip)" >> $GITHUB_ENV
+      - name: Terraform Validate
+        run: terraform -chdir=terraform validate
 
-    # 🔥 SSH KEY SETUP
-    - name: Setup SSH Key
-      run: |
-        echo "${{ secrets.EC2_KEY }}" | sed 's/\\n/\n/g' > key.pem
-        chmod 400 key.pem
+      - name: Terraform Plan
+        run: terraform -chdir=terraform plan -out=tfplan
 
-    - name: Debug Key
-      run: |
-        head -n 5 key.pem
-        wc -l key.pem
+      - name: Terraform Apply
+        run: terraform -chdir=terraform apply -auto-approve tfplan
 
-    # 🔥 WAIT FOR EC2 SSH
-    - name: Wait for SSH
-      run: |
-        until ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "echo ready"; do
-          echo "Waiting for EC2..."
-          sleep 10
-        done
+      - name: Get Master IP
+        id: get_master_ip
+        run: |
+          MASTER_IP=$(terraform -chdir=terraform output -raw master_public_ip 2>/dev/null || true)
+          echo "MASTER_IP=$MASTER_IP" >> $GITHUB_ENV
+          echo "master_ip=$MASTER_IP" >> $GITHUB_OUTPUT
 
-    # 🔥 WAIT EXTRA FOR INSTANCE CLOUD-INIT / PACKAGE STABILIZATION
-    - name: Wait for Instance Stabilization
-      run: sleep 120
+          if [ -z "$MASTER_IP" ]; then
+            echo "❌ ERROR: MASTER_IP is empty. Terraform output failed."
+            exit 1
+          fi
 
-    # 🔥 RUN BOOTSTRAP
-    - name: Run Bootstrap
-      run: |
-        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "bash -s" < scripts/bootstrap.sh
+          echo "✅ MASTER_IP=$MASTER_IP"
 
-    # 🔥 WAIT FOR K8S API TO STABILIZE
-    - name: Wait for Kubernetes API
-      run: |
-        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP '
-          until kubectl get nodes >/dev/null 2>&1; do
-            echo "Waiting for Kubernetes API..."
-            sleep 10
+      - name: Setup SSH Key
+        if: success()
+        run: |
+          echo "${{ secrets.EC2_KEY }}" | sed 's/\\n/\n/g' > key.pem
+          chmod 400 key.pem
+
+          if [ ! -s key.pem ]; then
+            echo "❌ ERROR: key.pem was not created correctly."
+            exit 1
+          fi
+
+      - name: Wait for SSH
+        if: success()
+        run: |
+          for i in {1..30}; do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i key.pem ubuntu@$MASTER_IP "echo ready"; then
+              echo "✅ SSH is ready"
+              exit 0
+            fi
+            echo "⏳ Waiting for EC2 SSH... attempt $i/30"
+            sleep 15
           done
-        '
+          echo "❌ SSH never became ready"
+          exit 1
 
-    # 🔥 CHECK CLUSTER
-    - name: Verify Kubernetes Cluster
-      run: |
-        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "kubectl get nodes -o wide"
+      - name: Wait for Instance Stabilization
+        if: success()
+        run: sleep 120
 
-    # 🔥 APPLY ARGOCD APP
-    - name: Apply ArgoCD App
-      run: |
-        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "kubectl apply -f ~/devops-ecommerce-kubeadm/argocd/app.yaml"
+      - name: Run Bootstrap
+        if: success()
+        run: |
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "bash -s" < scripts/bootstrap.sh
 
-    # 🔥 WAIT FOR ARGOCD APP OBJECT
-    - name: Wait for ArgoCD Application
-      run: |
-        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP '
-          until kubectl get application ecommerce-app -n argocd >/dev/null 2>&1; do
-            echo "Waiting for ArgoCD Application..."
-            sleep 10
-          done
-        '
+      - name: Wait for Kubernetes API
+        if: success()
+        run: |
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP '
+            for i in {1..60}; do
+              if kubectl get nodes >/dev/null 2>&1; then
+                echo "✅ Kubernetes API is ready"
+                exit 0
+              fi
+              echo "⏳ Waiting for Kubernetes API... attempt $i/60"
+              sleep 10
+            done
+            echo "❌ Kubernetes API did not become ready"
+            exit 1
+          '
 
-    # 🔥 SHOW APP STATUS
-    - name: Check ArgoCD App Status
-      run: |
-        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "kubectl get application -n argocd"
+      - name: Verify Kubernetes Cluster
+        if: success()
+        run: |
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "kubectl get nodes -o wide"
 
-    # 🔥 WAIT FOR ECOMMERCE NAMESPACE
-    - name: Wait for Ecommerce Namespace
-      run: |
-        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP '
-          until kubectl get ns ecommerce >/dev/null 2>&1; do
-            echo "Waiting for ecommerce namespace..."
-            sleep 10
-          done
-        '
+      - name: Apply ArgoCD App
+        if: success()
+        run: |
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+            kubectl apply -f ~/devops-ecommerce-kubeadm/argocd/app.yaml
+          "
 
-    # 🔥 SMALL BUFFER FOR ARGOCD RESOURCE CREATION
-    - name: Wait for Initial Resource Creation
-      run: sleep 30
+      - name: Wait for ArgoCD Application
+        if: success()
+        run: |
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP '
+            for i in {1..30}; do
+              if kubectl get application ecommerce-app -n argocd >/dev/null 2>&1; then
+                echo "✅ ArgoCD Application exists"
+                exit 0
+              fi
+              echo "⏳ Waiting for ArgoCD Application... attempt $i/30"
+              sleep 10
+            done
+            echo "❌ ArgoCD Application not found"
+            exit 1
+          '
 
-    # 🔥 CREATE / UPDATE DJANGO SECRET
-    - name: Create Django Secret
-      run: |
-        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
-          kubectl create secret generic django-secret -n ecommerce \
-            --from-literal=SECRET_KEY='${{ secrets.DJANGO_SECRET_KEY }}' \
-            --from-literal=DATABASE_URL='${{ secrets.DATABASE_URL }}' \
-            --from-literal=REDIS_URL='${{ secrets.REDIS_URL }}' \
-            --from-literal=AWS_ACCESS_KEY_ID='${{ secrets.AWS_ACCESS_KEY_ID }}' \
-            --from-literal=AWS_SECRET_ACCESS_KEY='${{ secrets.AWS_SECRET_ACCESS_KEY }}' \
-            --from-literal=AWS_STORAGE_BUCKET_NAME='${{ secrets.AWS_STORAGE_BUCKET_NAME }}' \
-            --from-literal=AWS_S3_REGION_NAME='${{ secrets.AWS_S3_REGION_NAME }}' \
-            --dry-run=client -o yaml | kubectl apply -f -
-        "
+      - name: Check ArgoCD App Status
+        if: success()
+        run: |
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "kubectl get application -n argocd"
 
-    # 🔥 WAIT AFTER SECRET APPLY
-    - name: Wait After Secret Apply
-      run: sleep 20
+      - name: Wait for Ecommerce Namespace
+        if: success()
+        run: |
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP '
+            for i in {1..40}; do
+              if kubectl get ns ecommerce >/dev/null 2>&1; then
+                echo "✅ ecommerce namespace exists"
+                exit 0
+              fi
+              echo "⏳ Waiting for ecommerce namespace... attempt $i/40"
+              sleep 10
+            done
+            echo "❌ ecommerce namespace not created"
+            exit 1
+          '
 
-    # 🔥 RESTART DJANGO TO PICK NEW SECRET
-    - name: Restart Django Deployment
-      run: |
-        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
-          kubectl rollout restart deployment django -n ecommerce || true
-        "
+      - name: Wait for Initial Resource Creation
+        if: success()
+        run: sleep 45
 
-    # 🔥 WAIT BEFORE ROLLOUT STATUS
-    - name: Wait Before Rollout Check
-      run: sleep 20
+      - name: Create Django Secret
+        if: success()
+        run: |
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+            kubectl create secret generic django-secret -n ecommerce \
+              --from-literal=SECRET_KEY='${{ secrets.DJANGO_SECRET_KEY }}' \
+              --from-literal=DATABASE_URL='${{ secrets.DATABASE_URL }}' \
+              --from-literal=REDIS_URL='${{ secrets.REDIS_URL }}' \
+              --from-literal=AWS_ACCESS_KEY_ID='${{ secrets.AWS_ACCESS_KEY_ID }}' \
+              --from-literal=AWS_SECRET_ACCESS_KEY='${{ secrets.AWS_SECRET_ACCESS_KEY }}' \
+              --from-literal=AWS_STORAGE_BUCKET_NAME='${{ secrets.AWS_STORAGE_BUCKET_NAME }}' \
+              --from-literal=AWS_S3_REGION_NAME='${{ secrets.AWS_S3_REGION_NAME }}' \
+              --dry-run=client -o yaml | kubectl apply -f -
+          "
 
-    # 🔥 WAIT FOR DJANGO ROLLOUT
-    - name: Wait for Django Rollout
-      run: |
-        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
-          kubectl rollout status deployment django -n ecommerce --timeout=300s || true
-        "
+      - name: Wait After Secret Apply
+        if: success()
+        run: sleep 20
 
-    # 🔥 CHECK ECOMMERCE PODS
-    - name: Check Ecommerce Pods
-      run: |
-        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
-          kubectl get pods -n ecommerce -o wide || true
-          echo '---'
-          kubectl get svc -n ecommerce || true
-          echo '---'
-          kubectl get jobs -n ecommerce || true
-        "
+      - name: Restart Django Deployment
+        if: success()
+        run: |
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+            kubectl rollout restart deployment django -n ecommerce
+          "
 
-    # 🔥 CHECK DJANGO AWS ENV
-    - name: Verify Django AWS Env
-      run: |
-        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
-          kubectl exec -n ecommerce deploy/django -- env | grep AWS || true
-        "
+      - name: Wait Before Rollout Check
+        if: success()
+        run: sleep 20
 
-    # 🔥 SHOW DJANGO LOGS
-    - name: Show Django Logs
-      if: always()
-      run: |
-        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
-          kubectl logs deploy/django -n ecommerce --tail=150 || true
-        "
+      - name: Wait for Django Rollout
+        if: success()
+        run: |
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+            kubectl rollout status deployment django -n ecommerce --timeout=300s
+          "
 
-    # 🔥 DESCRIBE APP IF FAILED
-    - name: Debug ArgoCD App
-      if: always()
-      run: |
-        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
-          kubectl describe application ecommerce-app -n argocd || true
-          echo '---'
-          kubectl get all -n ecommerce || true
-          echo '---'
-          kubectl get events -n ecommerce --sort-by=.metadata.creationTimestamp || true
-        "
+      - name: Run Django Migrations
+        if: success()
+        run: |
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+            kubectl exec -n ecommerce deploy/django -- python manage.py migrate
+          "
+
+      - name: Check Ecommerce Pods
+        if: always()
+        run: |
+          if [ -n "$MASTER_IP" ] && [ -f key.pem ]; then
+            ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+              kubectl get pods -n ecommerce -o wide || true
+              echo '---'
+              kubectl get svc -n ecommerce || true
+              echo '---'
+              kubectl get jobs -n ecommerce || true
+            "
+          else
+            echo "Skipping pod check because MASTER_IP or key.pem is missing"
+          fi
+
+      - name: Verify Django AWS Env
+        if: always()
+        run: |
+          if [ -n "$MASTER_IP" ] && [ -f key.pem ]; then
+            ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+              kubectl exec -n ecommerce deploy/django -- env | grep AWS || true
+            "
+          else
+            echo "Skipping env check because MASTER_IP or key.pem is missing"
+          fi
+
+      - name: Show Django Logs
+        if: always()
+        run: |
+          if [ -n "$MASTER_IP" ] && [ -f key.pem ]; then
+            ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+              kubectl logs deploy/django -n ecommerce --tail=150 || true
+            "
+          else
+            echo "Skipping Django logs because MASTER_IP or key.pem is missing"
+          fi
+
+      - name: Debug ArgoCD App
+        if: always()
+        run: |
+          if [ -n "$MASTER_IP" ] && [ -f key.pem ]; then
+            ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+              kubectl describe application ecommerce-app -n argocd || true
+              echo '---'
+              kubectl get all -n ecommerce || true
+              echo '---'
+              kubectl get events -n ecommerce --sort-by=.metadata.creationTimestamp || true
+            "
+          else
+            echo "Skipping ArgoCD debug because MASTER_IP or key.pem is missing"
+          fi
