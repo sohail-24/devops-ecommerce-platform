@@ -1,5 +1,6 @@
 resource "aws_s3_bucket" "django_media" {
-  bucket = "sohail-django-media-bucket"
+  bucket        = "sohail-django-media-bucket"
+  force_destroy = true
 
   tags = {
     Name        = "django-media-bucket"
