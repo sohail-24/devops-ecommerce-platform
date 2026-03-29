@@ -2,20 +2,66 @@ name: Destroy Infra
 
 on:
   workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type DESTROY to confirm infrastructure deletion"
+        required: true
+        default: "NO"
 
 jobs:
   destroy:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      TF_IN_AUTOMATION: true
+      AWS_REGION: ap-south-1
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: 🚀 Checkout Repo
+        uses: actions/checkout@v4
 
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v3
+      - name: ⚙️ Setup Terraform
+        uses: hashicorp/setup-terraform@v3
 
-    - name: Terraform Init
-      run: terraform -chdir=terraform init
+      - name: 🔐 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
 
-    - name: Terraform Destroy
-      run: terraform -chdir=terraform destroy -auto-approve
+      - name: 🧪 Verify AWS Access
+        run: aws sts get-caller-identity
+
+      - name: 📦 Terraform Init
+        run: terraform -chdir=terraform init
+
+      - name: ✅ Terraform Validate
+        run: terraform -chdir=terraform validate
+
+      - name: 📊 Terraform Plan (Destroy Preview)
+        run: terraform -chdir=terraform plan -destroy
+
+      - name: ❌ Check Confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "DESTROY" ]; then
+            echo "❌ You must type DESTROY to proceed"
+            exit 1
+          fi
+          echo "⚠️ Destruction confirmed"
+
+      - name: 💥 Terraform Destroy
+        run: terraform -chdir=terraform destroy -auto-approve
+
+      - name: 📋 Post-Destroy Check
+        run: |
+          echo "🔍 Checking remaining AWS resources..."
+
+          echo "--- EC2 Instances ---"
+          aws ec2 describe-instances --query "Reservations[*].Instances[*].InstanceId" --output text || true
+
+          echo "--- S3 Buckets ---"
+          aws s3 ls || true
+
+          echo "✅ Destroy process completed"
