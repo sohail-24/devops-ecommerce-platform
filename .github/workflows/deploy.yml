@@ -4,6 +4,18 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment environment"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+      confirm_apply:
+        description: "Type yes to confirm deployment"
+        required: true
+        default: "yes"
 
 permissions:
   contents: read
@@ -14,16 +26,30 @@ concurrency:
 
 jobs:
   deploy:
+    name: Deploy to ${{ github.event.inputs.environment || 'dev' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 50
+    environment: dev
 
     env:
       TF_IN_AUTOMATION: true
       AWS_REGION: ap-south-1
 
+    defaults:
+      run:
+        shell: bash
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Validate Manual Confirmation
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [[ "${{ github.event.inputs.confirm_apply }}" != "yes" ]]; then
+            echo "❌ Deployment cancelled. confirm_apply must be 'yes'."
+            exit 1
+          fi
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -45,7 +71,14 @@ jobs:
         run: terraform -chdir=terraform validate
 
       - name: Terraform Plan
-        run: terraform -chdir=terraform plan -out=tfplan
+        run: terraform -chdir=terraform plan -lock-timeout=300s -out=tfplan
+
+      - name: Upload Terraform Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: terraform/tfplan
+          retention-days: 3
 
       - name: Terraform Apply
         run: terraform -chdir=terraform apply -auto-approve tfplan
@@ -53,11 +86,12 @@ jobs:
       - name: Get Master IP
         id: get_master_ip
         run: |
+          set -e
           MASTER_IP=$(terraform -chdir=terraform output -raw master_public_ip 2>/dev/null || true)
-          echo "MASTER_IP=$MASTER_IP" >> $GITHUB_ENV
-          echo "master_ip=$MASTER_IP" >> $GITHUB_OUTPUT
+          echo "MASTER_IP=$MASTER_IP" >> "$GITHUB_ENV"
+          echo "master_ip=$MASTER_IP" >> "$GITHUB_OUTPUT"
 
-          if [ -z "$MASTER_IP" ]; then
+          if [[ -z "$MASTER_IP" ]]; then
             echo "❌ ERROR: MASTER_IP is empty. Terraform output failed."
             exit 1
           fi
@@ -67,19 +101,23 @@ jobs:
       - name: Setup SSH Key
         if: success()
         run: |
+          set -e
           echo "${{ secrets.EC2_KEY }}" | sed 's/\\n/\n/g' > key.pem
           chmod 400 key.pem
 
-          if [ ! -s key.pem ]; then
+          if [[ ! -s key.pem ]]; then
             echo "❌ ERROR: key.pem was not created correctly."
             exit 1
           fi
 
+          ssh-keygen -R "$MASTER_IP" || true
+
       - name: Wait for SSH
         if: success()
         run: |
+          set -e
           for i in {1..30}; do
-            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i key.pem ubuntu@$MASTER_IP "echo ready"; then
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i key.pem ubuntu@"$MASTER_IP" "echo ready"; then
               echo "✅ SSH is ready"
               exit 0
             fi
@@ -91,17 +129,21 @@ jobs:
 
       - name: Wait for Instance Stabilization
         if: success()
-        run: sleep 120
+        run: sleep 180
 
       - name: Run Bootstrap
         if: success()
         run: |
-          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "bash -s" < scripts/bootstrap.sh
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@"$MASTER_IP" "bash -s" < scripts/bootstrap.sh
+
+      - name: Wait After Bootstrap
+        if: success()
+        run: sleep 90
 
       - name: Wait for Kubernetes API
         if: success()
         run: |
-          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP '
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@"$MASTER_IP" '
             for i in {1..60}; do
               if kubectl get nodes >/dev/null 2>&1; then
                 echo "✅ Kubernetes API is ready"
@@ -117,19 +159,19 @@ jobs:
       - name: Verify Kubernetes Cluster
         if: success()
         run: |
-          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "kubectl get nodes -o wide"
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@"$MASTER_IP" "kubectl get nodes -o wide"
 
       - name: Apply ArgoCD App
         if: success()
         run: |
-          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@"$MASTER_IP" "
             kubectl apply -f ~/devops-ecommerce-kubeadm/argocd/app.yaml
           "
 
       - name: Wait for ArgoCD Application
         if: success()
         run: |
-          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP '
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@"$MASTER_IP" '
             for i in {1..30}; do
               if kubectl get application ecommerce-app -n argocd >/dev/null 2>&1; then
                 echo "✅ ArgoCD Application exists"
@@ -145,12 +187,12 @@ jobs:
       - name: Check ArgoCD App Status
         if: success()
         run: |
-          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "kubectl get application -n argocd"
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@"$MASTER_IP" "kubectl get application -n argocd"
 
       - name: Wait for Ecommerce Namespace
         if: success()
         run: |
-          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP '
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@"$MASTER_IP" '
             for i in {1..40}; do
               if kubectl get ns ecommerce >/dev/null 2>&1; then
                 echo "✅ ecommerce namespace exists"
@@ -165,12 +207,12 @@ jobs:
 
       - name: Wait for Initial Resource Creation
         if: success()
-        run: sleep 45
+        run: sleep 60
 
       - name: Create Django Secret
         if: success()
         run: |
-          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@"$MASTER_IP" "
             kubectl create secret generic django-secret -n ecommerce \
               --from-literal=SECRET_KEY='${{ secrets.DJANGO_SECRET_KEY }}' \
               --from-literal=DATABASE_URL='${{ secrets.DATABASE_URL }}' \
@@ -184,38 +226,38 @@ jobs:
 
       - name: Wait After Secret Apply
         if: success()
-        run: sleep 20
+        run: sleep 30
 
       - name: Restart Django Deployment
         if: success()
         run: |
-          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@"$MASTER_IP" "
             kubectl rollout restart deployment django -n ecommerce
           "
 
       - name: Wait Before Rollout Check
         if: success()
-        run: sleep 20
+        run: sleep 30
 
       - name: Wait for Django Rollout
         if: success()
         run: |
-          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@"$MASTER_IP" "
             kubectl rollout status deployment django -n ecommerce --timeout=300s
           "
 
       - name: Run Django Migrations
         if: success()
         run: |
-          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@"$MASTER_IP" "
             kubectl exec -n ecommerce deploy/django -- python manage.py migrate
           "
 
       - name: Check Ecommerce Pods
         if: always()
         run: |
-          if [ -n "$MASTER_IP" ] && [ -f key.pem ]; then
-            ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+          if [[ -n "$MASTER_IP" && -f key.pem ]]; then
+            ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@"$MASTER_IP" "
               kubectl get pods -n ecommerce -o wide || true
               echo '---'
               kubectl get svc -n ecommerce || true
@@ -229,8 +271,8 @@ jobs:
       - name: Verify Django AWS Env
         if: always()
         run: |
-          if [ -n "$MASTER_IP" ] && [ -f key.pem ]; then
-            ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+          if [[ -n "$MASTER_IP" && -f key.pem ]]; then
+            ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@"$MASTER_IP" "
               kubectl exec -n ecommerce deploy/django -- env | grep AWS || true
             "
           else
@@ -240,8 +282,8 @@ jobs:
       - name: Show Django Logs
         if: always()
         run: |
-          if [ -n "$MASTER_IP" ] && [ -f key.pem ]; then
-            ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+          if [[ -n "$MASTER_IP" && -f key.pem ]]; then
+            ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@"$MASTER_IP" "
               kubectl logs deploy/django -n ecommerce --tail=150 || true
             "
           else
@@ -251,8 +293,8 @@ jobs:
       - name: Debug ArgoCD App
         if: always()
         run: |
-          if [ -n "$MASTER_IP" ] && [ -f key.pem ]; then
-            ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$MASTER_IP "
+          if [[ -n "$MASTER_IP" && -f key.pem ]]; then
+            ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@"$MASTER_IP" "
               kubectl describe application ecommerce-app -n argocd || true
               echo '---'
               kubectl get all -n ecommerce || true
@@ -262,3 +304,7 @@ jobs:
           else
             echo "Skipping ArgoCD debug because MASTER_IP or key.pem is missing"
           fi
+
+      - name: Cleanup SSH Key
+        if: always()
+        run: rm -f key.pem
